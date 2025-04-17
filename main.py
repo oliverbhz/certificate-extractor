@@ -13,6 +13,12 @@ from pdf2image import convert_from_path
 import tempfile
 import easyocr
 from PIL import Image, ImageEnhance
+import json
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.naive_bayes import MultinomialNB
+from sklearn.pipeline import Pipeline
+import joblib
+from pathlib import Path
 
 # Configuracao do logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -23,6 +29,101 @@ pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tessera
 
 # Configurar o caminho do Poppler
 os.environ['PATH'] = r'C:\Program Files\poppler\poppler-24.08.0\Library\bin' + os.pathsep + os.environ['PATH']
+
+# Diretório para armazenar dados de treinamento
+TRAINING_DATA_DIR = Path("training_data")
+TRAINING_DATA_DIR.mkdir(exist_ok=True)
+
+class TextClassifier:
+    def __init__(self):
+        self.model = Pipeline([
+            ('tfidf', TfidfVectorizer()),
+            ('clf', MultinomialNB())
+        ])
+        self.training_data = self._load_training_data()
+        self._train_model()
+
+    def _load_training_data(self) -> Dict[str, List[str]]:
+        """Carrega dados de treinamento do diretório."""
+        data = {
+            "nome": [],
+            "data": [],
+            "id": [],
+            "tipo_documento": [],
+            "outros": []
+        }
+        
+        training_file = TRAINING_DATA_DIR / "training_data.json"
+        if training_file.exists():
+            with open(training_file, 'r', encoding='utf-8') as f:
+                saved_data = json.load(f)
+                data.update(saved_data)
+        
+        return data
+
+    def _save_training_data(self):
+        """Salva dados de treinamento no diretório."""
+        training_file = TRAINING_DATA_DIR / "training_data.json"
+        with open(training_file, 'w', encoding='utf-8') as f:
+            json.dump(self.training_data, f, ensure_ascii=False, indent=2)
+
+    def _train_model(self):
+        """Treina o modelo com os dados disponíveis."""
+        if not any(self.training_data.values()):
+            return
+
+        X = []
+        y = []
+        for category, texts in self.training_data.items():
+            X.extend(texts)
+            y.extend([category] * len(texts))
+
+        if X and y:
+            self.model.fit(X, y)
+            self._save_model()
+
+    def _save_model(self):
+        """Salva o modelo treinado."""
+        model_file = TRAINING_DATA_DIR / "classifier_model.joblib"
+        joblib.dump(self.model, model_file)
+
+    def _load_model(self):
+        """Carrega o modelo treinado."""
+        model_file = TRAINING_DATA_DIR / "classifier_model.joblib"
+        if model_file.exists():
+            self.model = joblib.load(model_file)
+
+    def classify_text(self, text: str) -> str:
+        """Classifica um texto em uma das categorias."""
+        if not any(self.training_data.values()):
+            return "outros"
+        
+        try:
+            return self.model.predict([text])[0]
+        except:
+            return "outros"
+
+    def add_training_example(self, text: str, category: str):
+        """Adiciona um novo exemplo de treinamento."""
+        if category not in self.training_data:
+            logger.warning(f"Categoria {category} não reconhecida")
+            return
+
+        self.training_data[category].append(text)
+        self._save_training_data()
+        self._train_model()
+
+    def get_suggested_categories(self, text: str) -> List[Tuple[str, float]]:
+        """Retorna categorias sugeridas com suas probabilidades."""
+        if not any(self.training_data.values()):
+            return [("outros", 1.0)]
+        
+        try:
+            probs = self.model.predict_proba([text])[0]
+            categories = self.model.classes_
+            return list(zip(categories, probs))
+        except:
+            return [("outros", 1.0)]
 
 def enhance_image(image: np.ndarray) -> np.ndarray:
     """
@@ -285,12 +386,13 @@ def extract_text_from_pdf(pdf_path: str, start_page: int = 0, max_pages: Optiona
         logger.error(f"Erro ao extrair texto do PDF: {str(e)}")
         raise
 
-def extract_certificate_data(text: str) -> Dict[str, str]:
+def extract_certificate_data(text: str, classifier: Optional[TextClassifier] = None) -> Dict[str, str]:
     """
     Extrai dados específicos do certificado a partir do texto.
     
     Args:
         text: Texto extraído do certificado
+        classifier: Classificador de texto opcional
     
     Returns:
         Dict[str, str]: Dicionário com os dados extraídos
@@ -304,13 +406,37 @@ def extract_certificate_data(text: str) -> Dict[str, str]:
     # Inicializa o dicionário de resultados
     data = {
         "nome": "",
-        "tipo_certificado": "SCRUM FOUNDATION PROFESSIONAL CERTIFICATE (SFPC)",
+        "tipo_certificado": "",
         "data": "",
         "id_cp": "",
         "texto_lateral": "",
         "rodape": "",
         "assinatura": ""
     }
+    
+    # Se um classificador for fornecido, use-o para ajudar na extração
+    if classifier:
+        # Divide o texto em linhas e classifica cada uma
+        lines = text.split('\n')
+        classified_lines = [(line, classifier.classify_text(line)) for line in lines if line.strip()]
+        
+        # Agrupa linhas por categoria
+        categorized_lines = {}
+        for line, category in classified_lines:
+            if category not in categorized_lines:
+                categorized_lines[category] = []
+            categorized_lines[category].append(line)
+        
+        # Usa as linhas classificadas para ajudar na extração
+        for category, lines in categorized_lines.items():
+            if category == "nome":
+                data["nome"] = " ".join(lines)
+            elif category == "data":
+                data["data"] = " ".join(lines)
+            elif category == "id":
+                data["id_cp"] = " ".join(lines)
+            elif category == "tipo_documento":
+                data["tipo_certificado"] = " ".join(lines)
     
     # Padrões de regex específicos para o formato do certificado SFPC
     patterns = {
@@ -387,13 +513,14 @@ def extract_certificate_data(text: str) -> Dict[str, str]:
 def main():
     """Função principal para executar a extração e exibir resultados."""
     pdf_path = "teste.pdf"
+    classifier = TextClassifier()
 
     try:
         # Extrai texto do PDF
         text = extract_text_from_pdf(pdf_path)
         
         # Extrai informações do certificado
-        info = extract_certificate_data(text)
+        info = extract_certificate_data(text, classifier)
         
         # Exibe os resultados
         print("\nInformações do Certificado:")
@@ -428,6 +555,18 @@ def main():
         print("\nArquivos gerados:")
         print("- texto_extraido.txt (texto completo extraído do certificado)")
         print("- imagem_processada.png (imagem após pré-processamento)")
+        
+        # Se o usuário quiser adicionar exemplos de treinamento
+        print("\nDeseja adicionar exemplos de treinamento para melhorar a classificação? (s/n)")
+        resposta = input().lower()
+        if resposta == 's':
+            print("\nPara cada campo, digite o texto que representa corretamente:")
+            for campo in ["nome", "data", "id", "tipo_documento"]:
+                print(f"\nExemplo de {campo}:")
+                exemplo = input().strip()
+                if exemplo:
+                    classifier.add_training_example(exemplo, campo)
+                    print(f"Exemplo de {campo} adicionado com sucesso!")
         
     except Exception as e:
         print(f"\nErro: {str(e)}")
