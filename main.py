@@ -19,9 +19,14 @@ from sklearn.naive_bayes import MultinomialNB
 from sklearn.pipeline import Pipeline
 import joblib
 from pathlib import Path
+import layoutparser as lp
 
 # Configuracao do logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    datefmt='%d/%m/%Y %H:%M:%S'
+)
 logger = logging.getLogger(__name__)
 
 # Configurar o caminho do Tesseract
@@ -125,265 +130,217 @@ class TextClassifier:
         except:
             return [("outros", 1.0)]
 
+def detect_layout(image: np.ndarray) -> List[Dict]:
+    """
+    Detecta o layout do documento usando LayoutParser
+    """
+    # Inicializar modelo de layout
+    model = lp.Detectron2LayoutModel(
+        config_path='lp://PubLayNet/mask_rcnn_X_101_32x8d_FPN_3x/config',
+        label_map={0: "Text", 1: "Title", 2: "List", 3: "Table", 4: "Figure"}
+    )
+    
+    # Detectar layout
+    layout = model.detect(image)
+    
+    # Ordenar blocos por posição vertical e depois horizontal
+    layout = lp.Layout([b for b in layout])
+    layout = layout.sort(key=lambda b: (b.coordinates[1], b.coordinates[0]))
+    
+    return layout
+
+def extract_text_with_layout(image: np.ndarray, layout: List[Dict], reader) -> Tuple[str, List[Dict]]:
+    """
+    Extrai texto preservando o layout
+    """
+    extracted_text = []
+    structured_data = []
+    
+    # Agrupar blocos por linhas baseado na posição vertical
+    y_tolerance = 10  # pixels de tolerância para considerar mesma linha
+    lines = {}
+    
+    # Encontrar a largura máxima do documento
+    height, width = image.shape[:2]
+    
+    for block in layout:
+        y1 = block.coordinates[1]
+        line_found = False
+        
+        for line_y in lines.keys():
+            if abs(y1 - line_y) <= y_tolerance:
+                lines[line_y].append(block)
+                line_found = True
+                break
+        
+        if not line_found:
+            lines[y1] = [block]
+    
+    # Processar cada linha
+    last_y = 0
+    last_was_separator = False
+    
+    for y, line_blocks in sorted(lines.items()):
+        # Adicionar linhas em branco entre blocos distantes
+        if last_y > 0 and y - last_y > 3 * y_tolerance and not last_was_separator:
+            extracted_text.append("")
+        last_y = y
+
+        # Ordenar blocos da linha da esquerda para direita
+        line_blocks.sort(key=lambda b: b.coordinates[0])
+        
+        # Processar blocos de texto na linha
+        line_parts = []
+        current_x = 0
+        
+        for block in line_blocks:
+            x1, y1, x2, y2 = block.coordinates
+            
+            # Adicionar espaçamento baseado na posição horizontal
+            if x1 > current_x:
+                padding = " " * ((x1 - current_x) // 10)
+                if padding:
+                    line_parts.append(padding)
+            
+            # Extrair texto da região
+            region = image[int(y1):int(y2), int(x1):int(x2)]
+            results = reader.readtext(region)
+            
+            block_text = []
+            for (bbox, text, conf) in results:
+                text = text.strip()
+                if text:
+                    block_text.append(text)
+                    structured_data.append({
+                        'text': text,
+                        'bbox': [[x + x1, y + y1] for [x, y] in bbox],
+                        'confidence': conf,
+                        'type': block.type
+                    })
+            
+            if block_text:
+                # Formatar texto baseado no tipo do bloco
+                if block.type == "Title":
+                    text = "  ".join(block_text).upper()
+                elif block.type == "List":
+                    text = "• " + " ".join(block_text)
+                elif block.type == "Table":
+                    text = " | ".join(block_text)
+                else:
+                    text = " ".join(block_text)
+                
+                line_parts.append(text)
+                current_x = x2
+        
+        if line_parts:
+            # Juntar partes da linha preservando o espaçamento
+            line_content = "".join(line_parts).rstrip()
+            if line_content:
+                extracted_text.append(line_content)
+    
+    return '\n'.join(extracted_text), structured_data
+
 def enhance_image(image: np.ndarray) -> np.ndarray:
     """
-    Melhora a qualidade da imagem para OCR.
-    
-    Args:
-        image: Imagem no formato numpy array
-    
-    Returns:
-        np.ndarray: Imagem melhorada
+    Melhora a qualidade da imagem para melhor OCR
     """
-    # Converte para PIL Image para ajustes de contraste e brilho
-    pil_image = Image.fromarray(image)
-    
-    # Ajusta contraste
-    enhancer = ImageEnhance.Contrast(pil_image)
-    pil_image = enhancer.enhance(1.5)
-    
-    # Ajusta brilho
-    enhancer = ImageEnhance.Brightness(pil_image)
-    pil_image = enhancer.enhance(1.2)
-    
-    # Converte de volta para numpy array
-    return np.array(pil_image)
-
-def calculate_dpi(image: np.ndarray) -> float:
-    """
-    Calcula o DPI aproximado da imagem.
-    
-    Args:
-        image: Imagem no formato numpy array
-    
-    Returns:
-        float: DPI estimado
-    """
-    height, width = image.shape[:2]
-    return min(width, height) / 8.5  # Assume página A4 padrão
-
-def preprocess_image(image: np.ndarray) -> np.ndarray:
-    """
-    Aplica pré-processamento na imagem para melhorar a extração de texto.
-    
-    Args:
-        image: Imagem no formato numpy array
-    
-    Returns:
-        np.ndarray: Imagem processada
-    """
-    # Converte para escala de cinza se necessário
+    # Converter para escala de cinza se necessário
     if len(image.shape) == 3:
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     else:
         gray = image
     
-    # Calcula e ajusta DPI
-    current_dpi = calculate_dpi(gray)
-    if current_dpi < 300:  # Se DPI menor que 300
-        scale_factor = 300 / current_dpi
-        gray = cv2.resize(gray, None, fx=scale_factor, fy=scale_factor, interpolation=cv2.INTER_CUBIC)
-    
-    # Melhora qualidade da imagem
-    enhanced = enhance_image(gray)
-    
-    # Aplica threshold adaptativo
+    # Aplicar threshold adaptativo
     binary = cv2.adaptiveThreshold(
-        enhanced, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2
+        gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+        cv2.THRESH_BINARY, 11, 2
     )
     
-    # Reduz ruído
+    # Reduzir ruído
     denoised = cv2.fastNlMeansDenoising(binary)
     
-    # Aumenta nitidez
-    kernel = np.array([[-1,-1,-1], [-1,9,-1], [-1,-1,-1]])
-    sharpened = cv2.filter2D(denoised, -1, kernel)
+    # Aumentar contraste
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+    enhanced = clahe.apply(denoised)
     
-    return sharpened
+    return enhanced
 
-def extract_text_with_easyocr(image: np.ndarray) -> str:
+def convert_numpy_types(obj):
+    """Convert numpy types to Python native types for JSON serialization."""
+    if isinstance(obj, (list, tuple)):
+        return [convert_numpy_types(item) for item in obj]
+    elif isinstance(obj, dict):
+        return {key: convert_numpy_types(value) for key, value in obj.items()}
+    elif isinstance(obj, np.integer):
+        return int(obj)
+    elif isinstance(obj, np.floating):
+        return float(obj)
+    elif isinstance(obj, np.ndarray):
+        return convert_numpy_types(obj.tolist())
+    return obj
+
+def process_document(file_path: str) -> Dict:
     """
-    Extrai texto usando EasyOCR.
-    
-    Args:
-        image: Imagem no formato numpy array
-    
-    Returns:
-        str: Texto extraído
+    Process document and extract text with layout preservation
     """
     try:
-        reader = easyocr.Reader(['en'], gpu=False)
-        # Configurações para melhor precisão
-        results = reader.readtext(
-            image,
-            detail=0,  # Retorna apenas o texto
-            paragraph=True,  # Agrupa texto em parágrafos
-            contrast_ths=0.3,  # Ajusta contraste
-            adjust_contrast=1.5,  # Aumenta contraste
-            text_threshold=0.7,  # Limite de confiança para detecção de texto
-            width_ths=0.7,  # Limite para largura de caracteres
-            height_ths=0.7  # Limite para altura de caracteres
-        )
-        return ' '.join(results)
-    except Exception as e:
-        logger.warning(f"Erro ao extrair texto com EasyOCR: {str(e)}")
-        return ""
-
-def extract_text_with_tesseract(image: np.ndarray) -> str:
-    """
-    Extrai texto usando Tesseract.
-    
-    Args:
-        image: Imagem no formato numpy array
-    
-    Returns:
-        str: Texto extraído
-    """
-    try:
-        custom_config = r'--oem 3 --psm 1'
-        return pytesseract.image_to_string(image, config=custom_config)
-    except Exception as e:
-        logger.warning(f"Erro ao extrair texto com Tesseract: {str(e)}")
-        return ""
-
-def clean_extracted_text(text: str) -> str:
-    """
-    Limpa e formata o texto extraído.
-    
-    Args:
-        text: Texto extraído do OCR
-    
-    Returns:
-        str: Texto limpo e formatado
-    """
-    # Remove caracteres especiais mantendo pontuação importante
-    text = re.sub(r'[^\w\s\-:@.,()"]', ' ', text)
-    
-    # Normaliza espaços e quebras de linha
-    text = re.sub(r'\s+', ' ', text)
-    text = text.replace(' :', ':').replace(' .', '.')
-    
-    # Corrige problemas comuns de OCR
-    text = text.replace('0nal', 'onal')
-    text = text.replace('W ed g e', 'KNOWLEDGE')
-    text = text.replace('SCRUMFOUNDAuloN', 'SCRUM FOUNDATION')
-    text = text.replace('DRECTO R', 'DIRECTOR')
-    text = text.replace('otESSIONA', 'PROFESSIONAL')
-    
-    # Remove linhas vazias ou só com espaços
-    lines = [line.strip() for line in text.split('\n') if line.strip()]
-    
-    # Remove linhas duplicadas mantendo a ordem
-    seen = set()
-    cleaned_lines = []
-    for line in lines:
-        normalized_line = ' '.join(line.split())  # Normaliza espaços internos
-        if normalized_line not in seen:
-            seen.add(normalized_line)
-            cleaned_lines.append(normalized_line)
-    
-    return '\n'.join(cleaned_lines)
-
-def extract_text_from_image(image_path: str) -> str:
-    """
-    Extrai texto de uma imagem usando múltiplos OCRs em cascata.
-    
-    Args:
-        image_path: Caminho da imagem
-    
-    Returns:
-        str: Texto extraído
-    """
-    # Carrega a imagem
-    image = cv2.imread(image_path)
-    if image is None:
-        raise ValueError(f"Não foi possível carregar a imagem: {image_path}")
-    
-    # Aplica pré-processamento
-    processed = preprocess_image(image)
-    
-    # Salva imagem processada para debug
-    debug_path = "imagem_processada.png"
-    cv2.imwrite(debug_path, processed)
-    logger.info(f"Imagem processada salva em: {debug_path}")
-    
-    # Tenta extrair texto com EasyOCR primeiro
-    text = extract_text_with_easyocr(processed)
-    if text.strip():
-        text = clean_extracted_text(text)
-        if len(text) > 100:  # Se encontrou texto suficiente
-            logger.info("Texto extraído com sucesso usando EasyOCR")
-            return text
-    
-    # Se EasyOCR falhou, usa Tesseract como última opção
-    text = extract_text_with_tesseract(processed)
-    if text.strip():
-        text = clean_extracted_text(text)
-        logger.info("Texto extraído com sucesso usando Tesseract")
-        return text
-    
-    logger.warning("Nenhum OCR conseguiu extrair texto suficiente")
-    return text
-
-def extract_text_from_pdf(pdf_path: str, start_page: int = 0, max_pages: Optional[int] = None) -> str:
-    """
-    Extrai texto do PDF usando OCR.
-    
-    Args:
-        pdf_path: Caminho do arquivo PDF
-        start_page: Página inicial (começando de 0)
-        max_pages: Número máximo de páginas a processar
-    
-    Returns:
-        str: Texto extraído do PDF
-    """
-    all_texts = []
-    
-    try:
-        # Extrai texto usando OCR
-        logger.info("Convertendo PDF para imagens...")
-        with tempfile.TemporaryDirectory() as temp_dir:
-            # Converte PDF para imagens
-            images = convert_from_path(pdf_path)
+        logger.info("Starting text extraction process")
+        
+        # Initialize EasyOCR
+        reader = easyocr.Reader(['en'])
+        
+        # Convert PDF to images if needed
+        if file_path.lower().endswith('.pdf'):
+            images = convert_from_path(file_path)
+            logger.info(f"Successfully converted PDF to {len(images)} images")
+        else:
+            images = [Image.open(file_path)]
+        
+        all_text = []
+        all_blocks = []
+        
+        # Process each page
+        for i, image in enumerate(images):
+            logger.info(f"Processing page {i}")
             
-            for i, image in enumerate(images[start_page:]):
-                if max_pages and i >= max_pages:
-                    break
-                
-                # Salva a imagem temporariamente
-                image_path = os.path.join(temp_dir, f'page_{i}.png')
-                image.save(image_path, 'PNG')
-                
-                # Extrai texto da imagem
-                logger.info(f"Extraindo texto da página {i} usando OCR...")
-                text = extract_text_from_image(image_path)
-                if text.strip():
-                    all_texts.append(text)
+            # Convert to numpy array
+            image_np = np.array(image)
+            
+            # Enhance image
+            enhanced = enhance_image(image_np)
+            
+            # Save processed image for debugging
+            cv2.imwrite('imagem_processada.png', enhanced)
+            
+            # Detect layout
+            layout = detect_layout(enhanced)
+            
+            # Extract text with layout
+            text, blocks_data = extract_text_with_layout(enhanced, layout, reader)
+            
+            if text.strip():
+                all_text.append(text)
+                all_blocks.extend(blocks_data)
         
-        # Combina todos os textos extraídos
-        combined_text = "\n".join(all_texts)
+        # Convert data to serializable format
+        result_data = {
+            'text': '\n\n=== Page Break ===\n\n'.join(all_text),
+            'blocks': all_blocks,
+            'pages': len(images)
+        }
         
-        # Limpa o texto
-        combined_text = re.sub(r'\n\s*\n', '\n\n', combined_text)
-        combined_text = re.sub(r' +', ' ', combined_text)
-        combined_text = combined_text.strip()
+        # Save results
+        with open('texto_extraido.txt', 'w', encoding='utf-8') as f:
+            f.write(result_data['text'])
         
-        # Remove caracteres não imprimíveis
-        combined_text = ''.join(char for char in combined_text if char.isprintable() or char == '\n')
+        with open('texto_extraido_estruturado.json', 'w', encoding='utf-8') as f:
+            json.dump(result_data, f, ensure_ascii=False, indent=2)
         
-        # Remove linhas duplicadas mantendo a ordem
-        seen = set()
-        cleaned_lines = []
-        for line in combined_text.split('\n'):
-            line = line.strip()
-            if line and line not in seen:
-                seen.add(line)
-                cleaned_lines.append(line)
+        logger.info("Text extraction completed successfully")
+        return result_data
         
-        return '\n'.join(cleaned_lines)
-    
     except Exception as e:
-        logger.error(f"Erro ao extrair texto do PDF: {str(e)}")
+        logger.error(f"Error processing document: {str(e)}")
         raise
 
 def extract_certificate_data(text: str, classifier: Optional[TextClassifier] = None) -> Dict[str, str]:
@@ -510,66 +467,151 @@ def extract_certificate_data(text: str, classifier: Optional[TextClassifier] = N
     
     return data
 
-def main():
-    """Função principal para executar a extração e exibir resultados."""
-    pdf_path = "teste.pdf"
-    classifier = TextClassifier()
+def group_text_blocks(blocks, max_y_diff=15, max_x_diff=100):
+    """Group text blocks into lines and columns based on their positions."""
+    if not blocks:
+        return []
+        
+    # Sort blocks by y-coordinate (vertically)
+    blocks.sort(key=lambda x: (x[0][0][1], x[0][0][0]))
+    
+    lines = []
+    current_line = []
+    current_y = blocks[0][0][0][1]
+    
+    # Group blocks into lines
+    for block in blocks:
+        y = block[0][0][1]
+        if abs(y - current_y) > max_y_diff:
+            if current_line:
+                # Sort blocks in line by x-coordinate
+                current_line.sort(key=lambda x: x[0][0][0])
+                lines.append(current_line)
+            current_line = [block]
+            current_y = y
+        else:
+            current_line.append(block)
+    
+    # Add the last line
+    if current_line:
+        current_line.sort(key=lambda x: x[0][0][0])
+        lines.append(current_line)
+    
+    # Format lines with proper spacing
+    formatted_lines = []
+    for line in lines:
+        formatted_line = ""
+        last_x_end = 0
+        
+        for block in line:
+            x_start = block[0][0][0]
+            text = block[1]
+            
+            # Add spacing based on x-coordinate difference
+            if last_x_end > 0:
+                x_diff = x_start - last_x_end
+                if x_diff > max_x_diff:
+                    formatted_line += "    "  # Tab for column separation
+                elif x_diff > 20:
+                    formatted_line += "  "  # Double space for word separation
+                else:
+                    formatted_line += " "  # Normal word spacing
+            
+            formatted_line += text
+            last_x_end = block[0][2][0]  # End x-coordinate of current block
+        
+        # Skip empty lines and lines with just spaces
+        if formatted_line.strip():
+            formatted_lines.append(formatted_line)
+    
+    return formatted_lines
 
+def extract_text_with_easyocr(image_path, reader):
+    """Extract text from image using EasyOCR with improved layout preservation."""
+    logger.info(f"Extracting text from {image_path}")
+    
+    # Read image
+    image = cv2.imread(image_path)
+    if image is None:
+        raise ValueError(f"Could not read image at {image_path}")
+    
+    # Get image dimensions
+    height, width = image.shape[:2]
+    
+    # Extract text with bounding boxes
+    results = reader.readtext(image)
+    
+    # Convert numpy types to Python native types
+    results = convert_numpy_types(results)
+    
+    # Group text blocks into lines with proper formatting
+    formatted_lines = group_text_blocks(results)
+    
+    # Combine lines into final text with proper spacing
+    text = "\n".join(formatted_lines)
+    
+    # Add page separator
+    text += "\n\n" + "="*80 + "\n\n"
+    
+    return text, results
+
+def main():
+    # Initialize EasyOCR
+    reader = easyocr.Reader(['en'])
+    
     try:
-        # Extrai texto do PDF
-        text = extract_text_from_pdf(pdf_path)
-        
-        # Extrai informações do certificado
-        info = extract_certificate_data(text, classifier)
-        
-        # Exibe os resultados
-        print("\nInformações do Certificado:")
-        print("-" * 50)
-        
-        # Campos principais
-        campos_principais = {
-            "Nome": info['nome'],
-            "Tipo de Certificado": info['tipo_certificado'],
-            "Data": info['data'],
-            "ID CP": info['id_cp']
-        }
-        
-        for campo, valor in campos_principais.items():
-            if valor:
-                print(f"{campo}: {valor}")
-        
-        # Informações adicionais
-        campos_adicionais = {
-            "Texto Adicional": info['texto_lateral'],
-            "Rodapé": info['rodape'],
-            "Assinatura": info['assinatura']
-        }
-        
-        campos_preenchidos = {k: v for k, v in campos_adicionais.items() if v}
-        if campos_preenchidos:
-            print("\nInformações Adicionais:")
-            for campo, valor in campos_preenchidos.items():
-                print(f"{campo}: {valor}")
-        
-        print("-" * 50)
-        print("\nArquivos gerados:")
-        print("- texto_extraido.txt (texto completo extraído do certificado)")
-        print("- imagem_processada.png (imagem após pré-processamento)")
-        
-        # Se o usuário quiser adicionar exemplos de treinamento
-        print("\nDeseja adicionar exemplos de treinamento para melhorar a classificação? (s/n)")
-        resposta = input().lower()
-        if resposta == 's':
-            print("\nPara cada campo, digite o texto que representa corretamente:")
-            for campo in ["nome", "data", "id", "tipo_documento"]:
-                print(f"\nExemplo de {campo}:")
-                exemplo = input().strip()
-                if exemplo:
-                    classifier.add_training_example(exemplo, campo)
-                    print(f"Exemplo de {campo} adicionado com sucesso!")
-        
+        # Try to process PDF first
+        pdf_path = 'teste.pdf'
+        if os.path.exists(pdf_path):
+            logger.info("Converting PDF to images...")
+            images = convert_from_path(pdf_path)
+            
+            logger.info(f"Successfully converted PDF to {len(images)} images")
+            
+            all_text = ""
+            all_blocks = []
+            
+            # Save pages as images and process them
+            for i, image in enumerate(images):
+                temp_path = f'temp_page_{i}.png'
+                image.save(temp_path)
+                
+                text, blocks = extract_text_with_easyocr(temp_path, reader)
+                all_text += f"\n--- Page {i+1} ---\n" + text
+                all_blocks.extend(blocks)
+                
+                os.remove(temp_path)
+                
+            # Save extracted text
+            with open('texto_extraido.txt', 'w', encoding='utf-8') as f:
+                f.write(all_text)
+                
+            # Save block data (already converted to native Python types)
+            with open('blocos.json', 'w', encoding='utf-8') as f:
+                json.dump(all_blocks, f, ensure_ascii=False, indent=2)
+                
+            logger.info("Successfully processed PDF")
+            
+        else:
+            # Try to process single image
+            image_path = 'imagem_processada.png'
+            if os.path.exists(image_path):
+                text, blocks = extract_text_with_easyocr(image_path, reader)
+                
+                with open('texto_extraido.txt', 'w', encoding='utf-8') as f:
+                    f.write(text)
+                    
+                with open('blocos.json', 'w', encoding='utf-8') as f:
+                    json.dump(blocks, f, ensure_ascii=False, indent=2)
+                    
+                logger.info("Successfully processed image")
+            else:
+                logger.error("No valid input file found")
+                return
+                
     except Exception as e:
-        print(f"\nErro: {str(e)}")
+        logger.error(f"Error processing document: {str(e)}")
+        raise
 
 if __name__ == "__main__":
     main()
